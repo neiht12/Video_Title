@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from fractions import Fraction
+from pathlib import Path
 from typing import TypeAlias
 
 import numpy as np
@@ -64,6 +65,9 @@ class VideoInfo:
     audio_streams: tuple[AudioStreamInfo, ...] = ()
     start_time: Fraction | None = None
     duration: Fraction | None = None
+    path: Path | None = None
+    rotation: int = 0
+    frame_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.width <= 0 or self.height <= 0:
@@ -78,6 +82,14 @@ class VideoInfo:
         _valid_fraction(self.duration, "duration", allow_none=True)
         if self.duration is not None and self.duration < 0:
             raise ValueError("video duration cannot be negative")
+        if self.rotation not in (0, 90, 180, 270):
+            raise ValueError("rotation must be one of 0, 90, 180, or 270 degrees")
+        if self.frame_count is not None and self.frame_count < 0:
+            raise ValueError("frame_count cannot be negative")
+
+    @property
+    def has_audio(self) -> bool:
+        return bool(self.audio_streams)
 
 
 @dataclass(frozen=True, slots=True)
