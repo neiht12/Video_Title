@@ -158,6 +158,8 @@ class FrameObservation:
     time_sec: Fraction
     lines: tuple[LineDetection, ...]
     fingerprints: tuple[bytes | str, ...] = ()
+    source_pts: int | None = None
+    style_scores: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         if self.frame_index < 0:
@@ -165,6 +167,12 @@ class FrameObservation:
         _valid_fraction(self.time_sec, "time_sec")
         if self.fingerprints and len(self.fingerprints) != len(self.lines):
             raise ValueError("fingerprints must contain one value per line when provided")
+        if self.source_pts is not None and (not isinstance(self.source_pts, int) or isinstance(self.source_pts, bool)):
+            raise TypeError("source_pts must be an integer when provided")
+        if self.style_scores and len(self.style_scores) != len(self.lines):
+            raise ValueError("style_scores must contain one value per line when provided")
+        for score in self.style_scores:
+            _validate_score(score)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,11 +181,14 @@ class FrameBoxes:
     time_sec: Fraction
     event_id: int | str | None
     boxes_xyxy: tuple[BBoxXYXY, ...]
+    source_pts: int
 
     def __post_init__(self) -> None:
         if self.frame_index < 0:
             raise ValueError("frame_index must be nonnegative")
         _valid_fraction(self.time_sec, "time_sec")
+        if not isinstance(self.source_pts, int) or isinstance(self.source_pts, bool):
+            raise TypeError("source_pts must be an integer")
         for box in self.boxes_xyxy:
             _validate_box(box)
 

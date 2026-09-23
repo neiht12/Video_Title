@@ -19,7 +19,7 @@ import av
 import cv2
 import numpy as np
 
-from src.schemas import AudioStreamInfo, BBoxXYXY, LineDetection, VideoFrame, VideoInfo
+from src.schemas import AudioStreamInfo, BBoxXYXY, FrameBoxes, LineDetection, VideoFrame, VideoInfo
 
 
 class VideoIOError(RuntimeError):
@@ -259,16 +259,14 @@ def _validate_boxes(boxes_xyxy: Sequence[BBoxXYXY], info: VideoInfo) -> tuple[BB
     try:
         boxes = tuple(tuple(float(value) for value in box) for box in boxes_xyxy)
     except (TypeError, ValueError) as exc:
-        raise VideoIOError("Each fixed box must contain four finite numeric coordinates.") from exc
+        raise VideoIOError("Each box must contain four finite numeric coordinates.") from exc
     for box in boxes:
         if len(box) != 4:
-            raise VideoIOError("Each fixed box must contain x1,y1,x2,y2.")
+            raise VideoIOError("Each box must contain x1,y1,x2,y2.")
         try:
             LineDetection(box, score=1.0).validate_frame_bounds(info.width, info.height)
         except (TypeError, ValueError) as exc:
             raise VideoIOError(f"Invalid box {box} for frame {info.width}x{info.height}: {exc}") from exc
-    if not boxes:
-        raise VideoIOError("At least one fixed box is required for the smoke export.")
     return boxes
 
 
@@ -277,8 +275,9 @@ def _encode_video_stage(
     stage_path: Path,
     info: VideoInfo,
     requested_start: Fraction,
-    requested_end: Fraction,
-    boxes: tuple[BBoxXYXY, ...],
+    requested_end: Fraction | None,
+    boxes: tuple[BBoxXYXY, ...] | None,
+    frame_boxes: Sequence[FrameBoxes] | None,
     box_color_bgr: tuple[int, int, int],
     box_thickness: int,
 ) -> tuple[int, int, Fraction]:
@@ -294,8 +293,28 @@ def _encode_video_stage(
         for source_frame in _iter_frames(input_path, info):
             if source_frame.time_sec < requested_start:
                 continue
-            if source_frame.time_sec >= requested_end:
+            if requested_end is not None and source_frame.time_sec >= requested_end:
                 break
+            if frame_boxes is not None:
+                if frame_count >= len(frame_boxes):
+                    raise VideoIOError(
+                        f"Box timeline ended before source frame {source_frame.index} "
+                        f"(PTS {source_frame.source_pts})."
+                    )
+                expected = frame_boxes[frame_count]
+                if (expected.frame_index != source_frame.index
+                        or expected.source_pts != source_frame.source_pts
+                        or expected.time_sec != source_frame.time_sec):
+                    raise VideoIOError(
+                        f"Box timeline mismatch at entry {frame_count}: expected frame_index="
+                        f"{source_frame.index}, PTS={source_frame.source_pts}, "
+                        f"time={source_frame.time_sec}; got frame_index={expected.frame_index}, "
+                        f"PTS={expected.source_pts}, time={expected.time_sec}."
+                    )
+                current_boxes = _validate_boxes(expected.boxes_xyxy, info)
+            else:
+                assert boxes is not None
+                current_boxes = boxes
             if output_container is None:
                 first_source_pts = source_frame.source_pts
                 first_source_time = source_frame.time_sec
@@ -313,7 +332,7 @@ def _encode_video_stage(
 
             assert output_container is not None and output_stream is not None
             image_bgr = source_frame.image_bgr.copy()
-            for x1, y1, x2, y2 in boxes:
+            for x1, y1, x2, y2 in current_boxes:
                 cv2.rectangle(
                     image_bgr,
                     (int(round(x1)), int(round(y1))),
@@ -337,6 +356,11 @@ def _encode_video_stage(
 
         if output_container is None or output_stream is None or first_source_pts is None or first_source_time is None:
             raise VideoIOError("The requested segment contains no video frames.")
+        if frame_boxes is not None and frame_count != len(frame_boxes):
+            raise VideoIOError(
+                f"Box timeline has {len(frame_boxes)} entries but the selected video has "
+                f"{frame_count} frames."
+            )
         try:
             for packet in output_stream.encode(None):
                 output_container.mux(packet)
@@ -350,6 +374,32 @@ def _encode_video_stage(
             output_container.close()
 
 
+def _run_mux(command: list[str], description: str) -> None:
+    result = subprocess.run(
+        command, check=False, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    if result.returncode != 0:
+        raise VideoIOError(f"{description}: {result.stderr.strip()}")
+
+
+def _remux_audio(
+    ffmpeg: str,
+    stage_path: Path,
+    input_path: Path,
+    mux_stage_path: Path,
+    first_source_time: Fraction,
+) -> None:
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(stage_path)]
+    if first_source_time:
+        command.extend(["-itsoffset", _format_seconds(-first_source_time)])
+    command.extend([
+        "-i", str(input_path), "-map", "0:v:0", "-map", "1:a", "-c:v", "copy",
+        "-c:a", "copy", "-movflags", "+faststart", str(mux_stage_path),
+    ])
+    _run_mux(command, "Could not remux source audio")
+
+
 def _mux_audio(
     ffmpeg: str,
     stage_path: Path,
@@ -357,16 +407,16 @@ def _mux_audio(
     mux_stage_path: Path,
     audio_count: int,
     first_source_time: Fraction,
-    requested_end: Fraction,
+    requested_end: Fraction | None,
 ) -> None:
     filters: list[str] = []
     output_labels: list[str] = []
     start_text = _format_seconds(first_source_time)
-    end_text = _format_seconds(requested_end)
+    end_text = f":end={_format_seconds(requested_end)}" if requested_end is not None else ""
     for index in range(audio_count):
         label = f"a{index}"
         filters.append(
-            f"[1:a:{index}]atrim=start={start_text}:end={end_text},"
+            f"[1:a:{index}]atrim=start={start_text}{end_text},"
             f"asetpts=PTS-({start_text})/TB[{label}]"
         )
         output_labels.append(label)
@@ -380,37 +430,30 @@ def _mux_audio(
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "160k",
-            "-shortest",
             "-movflags", "+faststart",
             str(mux_stage_path),
         ]
     )
-    result = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode != 0:
-        raise VideoIOError(
-            "Could not mux the source audio into the clip (audio is re-encoded to AAC for an exact segment cut): "
-            f"{result.stderr.strip()}"
-        )
+    _run_mux(command, "Could not encode source audio as AAC")
 
 
 def export_annotated_segment(
     input_path: str | Path,
     output_path: str | Path,
     *,
-    start_sec: int | float | str | Fraction,
-    duration_sec: int | float | str | Fraction,
-    boxes_xyxy: Sequence[BBoxXYXY],
+    start_sec: int | float | str | Fraction = 0,
+    duration_sec: int | float | str | Fraction | None = None,
+    boxes_xyxy: Sequence[BBoxXYXY] | None = None,
+    frame_boxes: Sequence[FrameBoxes] | None = None,
     box_color_bgr: tuple[int, int, int] = (0, 0, 255),
     box_thickness: int = 3,
 ) -> SegmentExport:
-    """Read a source-time segment, draw fixed full-frame boxes, and retain audio."""
+    """Export a segment or full video with fixed boxes or a checked per-frame timeline.
+
+    Supply exactly one of boxes_xyxy and frame_boxes. A timeline has one entry for
+    every selected frame, including frames with no boxes, and carries original PTS.
+    Omitting duration_sec with start_sec=0 selects the whole video.
+    """
 
     source = Path(input_path).expanduser().resolve()
     output = Path(output_path).expanduser().resolve(strict=False)
@@ -419,25 +462,28 @@ def export_annotated_segment(
     if source == output:
         raise VideoIOError("Output path must not overwrite the input video.")
     if output.suffix.lower() != ".mp4":
-        raise VideoIOError("The smoke clip output path must end in .mp4.")
+        raise VideoIOError("The output path must end in .mp4.")
 
     start_offset = _as_fraction(start_sec, "start_sec")
-    duration = _as_fraction(duration_sec, "duration_sec")
-    if start_offset < 0 or duration <= 0:
+    duration = _as_fraction(duration_sec, "duration_sec") if duration_sec is not None else None
+    if start_offset < 0 or (duration is not None and duration <= 0):
         raise VideoIOError("start_sec must be nonnegative and duration_sec must be positive.")
+    if duration is None and start_offset != 0:
+        raise VideoIOError("duration_sec is required when start_sec is nonzero.")
+    if (boxes_xyxy is None) == (frame_boxes is None):
+        raise VideoIOError("Provide exactly one of boxes_xyxy or frame_boxes.")
     if box_thickness <= 0:
         raise VideoIOError("box_thickness must be positive.")
     if len(box_color_bgr) != 3 or any(value < 0 or value > 255 for value in box_color_bgr):
         raise VideoIOError("box_color_bgr must contain three values in the range 0..255.")
 
     info = probe_video(source)
-    if not info.audio_streams:
-        raise VideoIOError(f"The source '{source}' has no audio stream to include in the clip.")
-    boxes = _validate_boxes(boxes_xyxy, info)
+    boxes = _validate_boxes(boxes_xyxy, info) if boxes_xyxy is not None else None
     source_start = info.start_time if info.start_time is not None else Fraction(0)
     requested_start = source_start + start_offset
-    requested_end = requested_start + duration
-    if info.duration is not None and requested_end > source_start + info.duration:
+    requested_end = requested_start + duration if duration is not None else None
+    if (requested_end is not None and info.duration is not None
+            and requested_end > source_start + info.duration):
         raise VideoIOError(
             f"Requested segment ends at {float(requested_end - source_start):.3f}s, "
             f"past the video duration {float(info.duration):.3f}s."
@@ -450,7 +496,7 @@ def export_annotated_segment(
     stage_id = uuid.uuid4().hex
     stage_path = output.with_name(f".{output.stem}.{stage_id}.stage.mp4")
     mux_stage_path = output.with_name(f".{output.stem}.{stage_id}.mux.mp4")
-    ffmpeg = _require_executable("ffmpeg")
+    audio_mode = "none (source has no audio)"
     try:
         frame_count, first_source_pts, first_source_time = _encode_video_stage(
             source,
@@ -459,19 +505,28 @@ def export_annotated_segment(
             requested_start,
             requested_end,
             boxes,
+            frame_boxes,
             box_color_bgr,
             box_thickness,
         )
-        _mux_audio(
-            ffmpeg,
-            stage_path,
-            source,
-            mux_stage_path,
-            len(info.audio_streams),
-            first_source_time,
-            requested_end,
-        )
-        mux_stage_path.replace(output)
+        if not info.audio_streams:
+            stage_path.replace(output)
+        else:
+            ffmpeg = _require_executable("ffmpeg")
+            if duration is None and all(stream.codec == "aac" for stream in info.audio_streams):
+                try:
+                    _remux_audio(ffmpeg, stage_path, source, mux_stage_path, first_source_time)
+                    audio_mode = "AAC remux (stream copy)"
+                except VideoIOError:
+                    _mux_audio(ffmpeg, stage_path, source, mux_stage_path,
+                               len(info.audio_streams), first_source_time, None)
+                    audio_mode = "AAC re-encode (remux unavailable)"
+            else:
+                _mux_audio(ffmpeg, stage_path, source, mux_stage_path,
+                           len(info.audio_streams), first_source_time, requested_end)
+                audio_mode = ("AAC re-encode (segment-accurate trim)" if duration is not None
+                              else "AAC re-encode (remux unavailable)")
+            mux_stage_path.replace(output)
     finally:
         for temporary_path in (stage_path, mux_stage_path):
             try:
@@ -484,8 +539,10 @@ def export_annotated_segment(
         frame_count=frame_count,
         first_source_pts=first_source_pts,
         first_source_time=first_source_time,
-        end_source_time=requested_end,
-        audio_mode="AAC re-encode for segment-accurate trimming",
+        end_source_time=(requested_end if requested_end is not None else
+                         source_start + info.duration if info.duration is not None else
+                         first_source_time + Fraction(frame_count, info.reference_fps or 30)),
+        audio_mode=audio_mode,
     )
 
 
